@@ -7,3 +7,4 @@ todo.md
 .venv/
 .DS_Store
 .env
+/.venv_py312
