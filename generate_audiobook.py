@@ -27,16 +27,17 @@ import sys
 from utils.run_shell_commands import check_if_ffmpeg_is_installed, check_if_calibre_is_installed
 from utils.file_utils import read_json, empty_directory
 from utils.audiobook_utils import merge_chapters_to_m4b, convert_audio_file_formats, add_silence_to_audio_file_by_reencoding_using_ffmpeg, merge_chapters_to_standard_audio_file, add_silence_to_audio_file_by_appending_pre_generated_silence
+from utils.check_if_kokoro_api_is_up import check_if_kokoro_api_is_up
 from dotenv import load_dotenv
 
 load_dotenv()
 
-KOKORO_BASE_URL = os.environ.get("KOKORO_BASE_URL")
-KOKORO_API_KEY = os.environ.get("KOKORO_API_KEY")
+KOKORO_BASE_URL = os.environ.get("KOKORO_BASE_URL", "http://localhost:8880/v1")
+KOKORO_API_KEY = os.environ.get("KOKORO_API_KEY", "not-needed")
 
 os.makedirs("audio_samples", exist_ok=True)
 
-client = OpenAI(
+openai_client = OpenAI(
     base_url=KOKORO_BASE_URL, api_key=KOKORO_API_KEY
 )
 
@@ -106,13 +107,14 @@ def find_voice_for_gender_score(character: str, character_gender_map, kokoro_voi
         if score == character_gender_score:
             return voice
 
-def generate_audio_with_single_voice(output_format, generate_m4b_audiobook_file=False, book_path=""):
+def generate_audio_with_single_voice(output_format, narrator_gender, generate_m4b_audiobook_file=False, book_path=""):
     """
     Generates an audiobook using a single voice for narration and another voice for dialogues.
     Takes in output_format as an argument for the output format of the audio.
+    Takes in narrator_gender as an argument for the narrator's gender.
 
     This function reads text from a file called "converted_book.txt" and generates an
-    audiobook using the "af_heart" voice as the narrator and "am_fenrir" voice as the dialogue speaker. The speed of the voice is set to 0.85.
+    audiobook based on the narrator's gender using the set voices for the narrator and the dialogue speaker. The speed of the voice is set to 0.85.
 
     The progress of the generation is displayed using a tqdm progress bar.
 
@@ -126,8 +128,15 @@ def generate_audio_with_single_voice(output_format, generate_m4b_audiobook_file=
     lines = text.split("\n")
 
     # Set the voices to be used
-    narrator_voice = "af_heart" # voice to be used for narration
-    dialogue_voice = "am_fenrir" # voice to be used for dialogue
+    narrator_voice = "" # voice to be used for narration
+    dialogue_voice = "" # voice to be used for dialogue
+
+    if narrator_gender == "male":
+        narrator_voice = "am_puck"
+        dialogue_voice = "af_alloy+am_puck"
+    else:
+        narrator_voice = "af_heart"
+        dialogue_voice = "af_sky"
 
     # Set the total number of lines to process for the progress bar
     total_size = len(lines)
@@ -140,7 +149,7 @@ def generate_audio_with_single_voice(output_format, generate_m4b_audiobook_file=
 
     # Create a progress bar
     with tqdm(total=total_size, unit="line", desc="Audio Generation Progress") as overall_pbar:
-        for line in lines:
+        for current_index, line in enumerate(lines):
             line = line.strip()
             if not line:
                 continue
@@ -166,7 +175,7 @@ def generate_audio_with_single_voice(output_format, generate_m4b_audiobook_file=
                         voice_to_speak_in = dialogue_voice
 
                     # Generate audio for the line using the TTS service
-                    with client.audio.speech.with_streaming_response.create(
+                    with openai_client.audio.speech.with_streaming_response.create(
                         model="kokoro",
                         voice=voice_to_speak_in,
                         response_format="aac",
@@ -180,6 +189,7 @@ def generate_audio_with_single_voice(output_format, generate_m4b_audiobook_file=
             if current_chapter_audio not in chapter_files:
                 chapter_files.append(current_chapter_audio)
             overall_pbar.update(1)
+            yield f"Generating audiobook. Progress: {current_index + 1}/{total_size} ({(current_index + 1) * 100 // total_size}%)"
 
     for chapter in chapter_files:
         add_silence_to_audio_file_by_appending_pre_generated_silence(temp_audio_dir, chapter)
@@ -200,7 +210,7 @@ def generate_audio_with_single_voice(output_format, generate_m4b_audiobook_file=
         merge_chapters_to_standard_audio_file(m4a_chapter_files)
         convert_audio_file_formats("m4a", output_format, "generated_audiobooks", "audiobook")
 
-def generate_audio_with_multiple_voices(output_format, generate_m4b_audiobook_file=False, book_path=""):
+def generate_audio_with_multiple_voices(output_format, narrator_gender, generate_m4b_audiobook_file=False, book_path=""):
     """
     Generates an audiobook with multiple voices by processing a JSONL file containing speaker-attributed lines.
     Takes in output_format as an argument for the output format of the audio.
@@ -213,7 +223,7 @@ def generate_audio_with_multiple_voices(output_format, generate_m4b_audiobook_fi
 
     Requirements:
     - A JSONL file named 'speaker_attributed_book.jsonl' containing lines and speaker information.
-    - Two JSON files: 'character_gender_map.json' and 'kokoro_voice_map.json' for mapping speakers to voices.
+    - Two JSON files: 'character_gender_map.json' and 'kokoro_voice_map_female_narrator.json'/ 'kokoro_voice_map_male_narrator.json' based on the narrator's gender for mapping speakers to voices.
     - A TTS client (e.g., `client.audio.speech`) configured for streaming audio generation.
 
     Output:
@@ -234,7 +244,13 @@ def generate_audio_with_multiple_voices(output_format, generate_m4b_audiobook_fi
 
     # Load mappings for character gender and voice selection
     character_gender_map = read_json("character_gender_map.json")
-    kokoro_voice_map = read_json("static_files/kokoro_voice_map.json")
+    kokoro_voice_map = None
+
+    if narrator_gender == "male":
+        kokoro_voice_map = read_json("static_files/kokoro_voice_map_male_narrator.json")
+    else:
+        kokoro_voice_map = read_json("static_files/kokoro_voice_map_female_narrator.json")
+
     narrator_voice = find_voice_for_gender_score("narrator", character_gender_map, kokoro_voice_map)  # Loading the default narrator voice
     
     # Get the total number of lines to process for the progress bar
@@ -248,7 +264,7 @@ def generate_audio_with_multiple_voices(output_format, generate_m4b_audiobook_fi
     
     # Initialize a progress bar to track the audio generation process
     with tqdm(total=total_size, unit="line", desc="Audio Generation Progress") as overall_pbar:
-        for doc in json_data_array:
+        for current_index,doc in enumerate(json_data_array):
             # Extract the line of text and the speaker from the JSON object
             line = doc["line"].strip()
 
@@ -278,7 +294,7 @@ def generate_audio_with_multiple_voices(output_format, generate_m4b_audiobook_fi
                     voice_to_speak_in = narrator_voice if part["type"] == "narration" else speaker_voice
 
                     # Generate audio for the line using the TTS service
-                    with client.audio.speech.with_streaming_response.create(
+                    with openai_client.audio.speech.with_streaming_response.create(
                         model="kokoro",
                         voice=voice_to_speak_in,
                         response_format="aac",
@@ -292,6 +308,7 @@ def generate_audio_with_multiple_voices(output_format, generate_m4b_audiobook_fi
             if current_chapter_audio not in chapter_files:
                 chapter_files.append(current_chapter_audio)
             overall_pbar.update(1)
+            yield f"Generating audiobook. Progress: {current_index + 1}/{total_size} ({(current_index + 1) * 100 // total_size}%)"
 
     for chapter in chapter_files:
         add_silence_to_audio_file_by_appending_pre_generated_silence(temp_audio_dir, chapter)
@@ -312,6 +329,29 @@ def generate_audio_with_multiple_voices(output_format, generate_m4b_audiobook_fi
         merge_chapters_to_standard_audio_file(m4a_chapter_files)
         convert_audio_file_formats("m4a", output_format, "generated_audiobooks", "audiobook")
 
+def process_audiobook_generation(voice_option, narrator_gender, output_format, book_path):
+    is_kokoro_api_up, message = check_if_kokoro_api_is_up(openai_client)
+
+    if not is_kokoro_api_up:
+        raise Exception(message)
+
+    generate_m4b_audiobook_file = False
+
+    if output_format == "M4B (Chapters & Cover)":
+        generate_m4b_audiobook_file = True
+
+    if voice_option == "Single Voice":
+        yield "\n🎧 Generating audiobook with a **single voice**..."
+        time.sleep(1)
+        for line in generate_audio_with_single_voice(output_format.lower(), narrator_gender, generate_m4b_audiobook_file, book_path):
+            yield line
+    elif voice_option == "Multi-Voice":
+        yield "\n🎭 Generating audiobook with **multiple voices**..."
+        time.sleep(1)
+        for line in generate_audio_with_multiple_voices(output_format.lower(), narrator_gender, generate_m4b_audiobook_file, book_path):
+            yield line
+
+    yield f"\n🎧 Audiobook is generated ! You can now download it in the Download section below. Click on the blue download link next to the file name."
 
 def main():
     os.makedirs("generated_audiobooks", exist_ok=True)
@@ -366,15 +406,25 @@ def main():
         if(output_format not in ["aac", "m4a", "mp3", "wav", "opus", "flac", "pcm"]):
             print("\n⚠️ Invalid output format! Please choose from the give options")
             return
+        
+    # Prompt user for narrator's gender selection
+    print("\n🎙️ **Audiobook Narrator Voice Selection**")
+    narrator_gender = input("🔹 Enter **male** if you want the book to be read in a male voice or **female** if you want the book to be read in a female voice: ").strip()
+
+    if narrator_gender not in ["male", "female"]:
+        print("\n⚠️ Invalid narrator gender! Please choose from the give options")
+        return
 
     start_time = time.time()
 
     if voice_option == "1":
         print("\n🎧 Generating audiobook with a **single voice**...")
-        generate_audio_with_single_voice(output_format, generate_m4b_audiobook_file, book_path)
+        for line in generate_audio_with_single_voice(output_format, narrator_gender, generate_m4b_audiobook_file, book_path):
+            print(line)
     elif voice_option == "2":
         print("\n🎭 Generating audiobook with **multiple voices**...")
-        generate_audio_with_multiple_voices(output_format, generate_m4b_audiobook_file, book_path)
+        for line in generate_audio_with_multiple_voices(output_format, narrator_gender, generate_m4b_audiobook_file, book_path):
+            print(line)
     else:
         print("\n⚠️ Invalid option! Please restart and enter either **1** or **2**.")
         return

@@ -28,21 +28,49 @@ import torch
 from gliner import GLiNER
 import warnings
 from utils.file_utils import write_jsons_to_jsonl_file, empty_file, write_json_to_file
+from utils.find_book_protagonist import find_book_protagonist
+from utils.check_if_llm_is_up import check_if_llm_is_up
 from dotenv import load_dotenv
+from huggingface_hub import snapshot_download
+
+def download_with_progress(model_name):
+    print(f"Starting download of {model_name}")
+    
+    # Define cache directory
+    cache_dir = os.path.join(os.getcwd(), "model_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # Log progress manually since tqdm might not work in Docker
+    print("Download in progress - this may take several minutes...")
+    
+    # Download without tqdm
+    snapshot_download(
+        repo_id=model_name,
+        cache_dir=cache_dir,
+        local_files_only=False,
+        local_dir=cache_dir
+    )
+    
+    print(f"Download complete for {model_name}")
+    
+    # Load the model from cache
+    return GLiNER.from_pretrained(model_name, cache_dir=cache_dir)
 
 load_dotenv()
 
-OPENAI_BASE_URL=os.environ.get("OPENAI_BASE_URL")
-OPENAI_API_KEY=os.environ.get("OPENAI_API_KEY")
-OPENAI_MODEL_NAME=os.environ.get("OPENAI_MODEL_NAME")
+OPENAI_BASE_URL=os.environ.get("OPENAI_BASE_URL", "http://localhost:1234/v1")
+OPENAI_API_KEY=os.environ.get("OPENAI_API_KEY", "lm-studio")
+OPENAI_MODEL_NAME=os.environ.get("OPENAI_MODEL_NAME", "phi-4")
 
-warnings.simplefilter("ignore")
+# warnings.simplefilter("ignore")
 
-openai = OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY)
+print("\n🚀 **Downloading the GLiNER Model ...**")
+
+openai_client = OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY)
 model_name = OPENAI_MODEL_NAME
-gliner_model = GLiNER.from_pretrained("urchade/gliner_large-v2.1")
+gliner_model = download_with_progress("urchade/gliner_large-v2.1")
 
-print("\n🚀 **Model Backend Selection**")
+print("\n🚀 **GLiNER Model Backend Selection**")
 
 if torch.cuda.is_available():
     print("🟢 Using **CUDA** backend (NVIDIA GPU detected)")
@@ -195,7 +223,7 @@ def identify_character_gender_and_age_using_llm_and_assign_score(character_name,
         """
 
         # Query the LLM to infer age and gender
-        response = openai.chat.completions.create(
+        response = openai_client.chat.completions.create(
             model=model_name,
             messages=[{"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}]
@@ -278,6 +306,8 @@ def identify_characters_and_output_book_to_jsonl(text: str, protagonist):
     # Clear the output JSONL file
     empty_file("speaker_attributed_book.jsonl")
 
+    yield("Identifying Characters. Progress 0%")
+
     # Initialize a set to track known characters
     known_characters = set()
 
@@ -299,7 +329,7 @@ def identify_characters_and_output_book_to_jsonl(text: str, protagonist):
             "narrator": {
                 "name": "narrator",
                 "age": "adult",
-                "gender": "female",
+                "gender": "female", # or male based on the user's selection in audiobook generation step 
                 "gender_score": 0  # Default score for the narrator
             }
         }
@@ -348,6 +378,7 @@ def identify_characters_and_output_book_to_jsonl(text: str, protagonist):
 
                 # Update the progress bar
                 overall_pbar.update(1)
+                yield f"Identifying Characters. Progress: {index + 1}/{len(lines)} ({(index + 1) * 100 // len(lines)}%)"
 
             except Exception as e:
                 # Handle errors and log them
@@ -360,6 +391,24 @@ def identify_characters_and_output_book_to_jsonl(text: str, protagonist):
     # Write the character gender and age scores to a JSON file
     write_json_to_file(character_gender_map, "character_gender_map.json")
 
+    yield "Character Identification Completed. You can now move onto the next step (Audiobook generation)."
+
+def process_book_and_identify_characters(book_name):
+    is_llm_up, message = check_if_llm_is_up(openai_client, model_name)
+
+    if not is_llm_up:
+        raise Exception(message)
+
+    yield "Finding protagonist. Please wait..."
+    protagonist = find_book_protagonist(book_name, openai_client, model_name)
+    f = open("converted_book.txt", "r")
+    book_text = f.read()
+    yield f"Found protagonist: {protagonist}"
+    time.sleep(1)
+
+    for update in identify_characters_and_output_book_to_jsonl(book_text, protagonist):
+        yield update
+
 def main():
     f = open("converted_book.txt", "r")
     book_text = f.read()
@@ -371,7 +420,8 @@ def main():
     # Start processing
     start_time = time.time()
     print("\n🔍 Identifying characters and processing the book...")
-    identify_characters_and_output_book_to_jsonl(book_text, protagonist)
+    for update in identify_characters_and_output_book_to_jsonl(book_text, protagonist):
+        print(update)
     end_time = time.time()
 
     # Calculate execution time
